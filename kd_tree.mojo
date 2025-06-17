@@ -1,9 +1,10 @@
 # I reimplemented the kd-tree implementation in C++ (and Fortran) by Matthew B. Kennel (https://github.com/jmhodges/kdtree2/) with some modifications.
 
-from mojmelo.utils.Matrix import Matrix
 from memory import UnsafePointer
 from buffer import NDBuffer
 import math
+from sys.info import simdwidthof, is_apple_silicon
+from memory import memcpy, memcmp, memset_zero, UnsafePointer
 
 @always_inline
 fn Abs(val: Float32) -> Float32:
@@ -13,23 +14,100 @@ fn Abs(val: Float32) -> Float32:
 fn Squared(val: Float32) -> Float32:
     return val ** 2
 
-@value
-struct interval:
+@fieldwise_init
+struct interval(Copyable, Movable):
     var lower: Float32
     var upper: Float32
 
-    fn __init__(out self, lower: Float32, upper: Float32):
-        self.lower = lower
-        self.upper = upper
+struct Matrix:
+    var height: Int
+    var width: Int
+    var size: Int
+    var data: UnsafePointer[Float32]
+    var order: String
+    alias simd_width: Int = 4 * simdwidthof[DType.float32]() if is_apple_silicon() else 2 * simdwidthof[DType.float32]()
 
-@value
-struct KDTreeResult:
+      # initialize from UnsafePointer
+    @always_inline
+    fn __init__(out self, data: UnsafePointer[Float32], height: Int, width: Int, order: String = 'c'):
+        self.height = height
+        self.width = width
+        self.size = height * width
+        self.data = data
+        self.order = order.lower()
+        
+    # initialize by copying from UnsafePointer
+    @always_inline
+    fn __init__(out self, height: Int, width: Int, data: UnsafePointer[Float32] = UnsafePointer[Float32](), order: String = 'c'):
+        self.height = height
+        self.width = width
+        self.size = height * width
+        self.data = UnsafePointer[Float32].alloc(self.size)
+        self.order = order.lower()
+        if data:
+            memcpy(self.data, data, self.size)
+
+    # initialize in 2D numpy style
+    fn __init__(out self, npstyle: String, order: String = 'c') raises:
+        var mat = npstyle.replace(' ', '')
+        if mat[0] == '[' and mat[1] == '[' and mat[len(mat) - 1] == ']' and mat[len(mat) - 2] == ']':
+            self.width = 0
+            self.size = 0
+            self.data = UnsafePointer[Float32]()
+            self.order = order.lower()
+            var rows = mat[:-1].split(']')
+            self.height = len(rows) - 1
+            for i in range(self.height):
+                var values = rows[i][2:].split(',')
+                if i == 0:
+                    self.width = len(values)
+                    self.size = self.height * self.width
+                    self.data = UnsafePointer[Float32].alloc(self.size)
+                for j in range(self.width):
+                    self.store[1](i, j, atof(values[j]).cast[DType.float32]())
+        else:
+            raise Error('Error: Matrix is not initialized in the correct form!')
+
+    @always_inline
+    fn load[nelts: Int](self, y: Int, x: Int) -> SIMD[DType.float32, nelts]:
+        var loc: Int
+        if self.order == 'c':
+            loc = (y * self.width) + x
+        else:
+            loc = (x * self.height) + y
+        return self.data.load[width=nelts](loc)
+
+    @always_inline
+    fn store[nelts: Int](self, y: Int, x: Int, val: SIMD[DType.float32, nelts]):
+        var loc: Int
+        if self.order == 'c':
+            loc = (y * self.width) + x
+        else:
+            loc = (x * self.height) + y
+        return self.data.store(loc, val)
+
+    fn __copyinit__(out self, other: Self):
+        self.height = other.height
+        self.width = other.width
+        self.size = other.size
+        self.data = UnsafePointer[Float32].alloc(self.size)
+        self.order = other.order
+        memcpy(self.data, other.data, self.size)
+
+    fn __moveinit__(out self, owned existing: Self):
+        self.height = existing.height
+        self.width = existing.width
+        self.size = existing.size
+        self.data = existing.data
+        self.order = existing.order
+        existing.height = existing.width = existing.size = 0
+        existing.order = ''
+        existing.data = UnsafePointer[Float32]()
+        
+@fieldwise_init
+struct KDTreeResult(Copyable, Movable):
     var dis: Float32  # its square Euclidean distance
     var idx: Int    # which neighbor was found
-
-    fn __init__(out self, dis: Float32, idx: Int):
-        self.dis = dis
-        self.idx = idx
 
     @always_inline
     fn __gt__(self, rhs: Self) -> Bool:
@@ -42,8 +120,8 @@ struct KDTreeResult:
     fn __le__(self, rhs: Self) capturing -> Bool:
         return self.dis <= rhs.dis
 
-@value
-struct KDTreeResultVector:
+@fieldwise_init
+struct KDTreeResultVector(Copyable, Movable, Sized):
     var _self: List[KDTreeResult]
     
     fn __init__(out self):
@@ -139,8 +217,8 @@ fn dis_from_bnd(x: Float32, amin: Float32, amax: Float32) -> Float32:
         return amin-x
     return 0.0
 
-@value
-struct KDTreeNode:
+@fieldwise_init
+struct KDTreeNode(Copyable, Movable):
     var cut_dim: Int # dimension to cut
     var cut_val: Float32
     var cut_val_left: Float32
@@ -315,8 +393,8 @@ struct KDTreeNode:
             var e = KDTreeResult(dis, indexofi)
             sr.result[]._self.append(e)
 
-@value
-struct KDTree[sort_results: Bool = False, rearrange: Bool = True]:
+@fieldwise_init
+struct KDTree[sort_results: Bool = False, rearrange: Bool = True](Copyable, Movable):
     var _data: Matrix
     var N: Int   # number of data points
     var dim: Int
